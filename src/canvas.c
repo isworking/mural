@@ -6,18 +6,18 @@
 #include <stdlib.h>
 #include <string.h>
 
-mrl_canvas_node *mrl_canvas_node_create(mrl_drawable *drawable)
+static mrl_canvas_node_page *mrl_canvas_alloc_page(void)
 {
-    mrl_canvas_node *node = malloc(sizeof(mrl_canvas_node));
+    mrl_canvas_node_page *page =
+        malloc(sizeof(*page));
 
-    mrl_canvas_node_set_drawable_clone(node, drawable);
+    if (!page)
+        return NULL;
 
-    mrl_canvas_node_set_next(node, NULL);
+    page->used = 0;
+    page->next = NULL;
 
-    mrl_canvas_node_set_visible(node, true);
-    mrl_canvas_node_set_opacity(node, 1.0f);
-
-    return node;
+    return page;
 }
 
 void mrl_canvas_node_set_drawable_clone(mrl_canvas_node *node, mrl_drawable *drawable)
@@ -74,16 +74,6 @@ mrl_pos mrl_canvas_node_get_position(const mrl_canvas_node *node)
     return MRL_POS(bounds.x, bounds.y);
 }
 
-void mrl_canvas_node_set_next(mrl_canvas_node *node, mrl_canvas_node *next)
-{
-    node->next = next;
-}
-
-mrl_canvas_node *mrl_canvas_node_get_next(const mrl_canvas_node *node)
-{
-    return node->next;
-}
-
 mrl_canvas *mrl_canvas_create(mrl_size size)
 {
     mrl_canvas *canvas = malloc(sizeof(mrl_canvas));
@@ -104,8 +94,8 @@ mrl_canvas *mrl_canvas_create(mrl_size size)
     memset(canvas->pixels, 0,
            sizeof(mrl_color) * size.w * size.h);
 
-    canvas->head = NULL;
-    canvas->tail = NULL;
+    canvas->pages = NULL;
+    canvas->last_page = NULL;
 
     return canvas;
 }
@@ -165,43 +155,25 @@ mrl_color mrl_canvas_get_pixel(const mrl_canvas *canvas, mrl_pos position)
     return mrl_canvas_get_pixels(canvas)[position.y * canvas->size.w + position.x];
 }
 
-void mrl_canvas_set_head(mrl_canvas *canvas, mrl_canvas_node *node)
-{
-    canvas->head = node;
-}
-
-mrl_canvas_node *mrl_canvas_get_head(const mrl_canvas *canvas)
-{
-    return canvas->head;
-}
-
-void mrl_canvas_set_tail(mrl_canvas *canvas, mrl_canvas_node *node)
-{
-    canvas->tail = node;
-}
-
-mrl_canvas_node *mrl_canvas_get_tail(const mrl_canvas *canvas)
-{
-    return canvas->tail;
-}
-
 void mrl_canvas_destroy(mrl_canvas *canvas)
 {
-    mrl_canvas_node *current = canvas->head;
+    mrl_canvas_node_page *page = canvas->pages;
 
-    while (current)
+    while (page)
     {
-        mrl_drawable_destroy(current->drawable);
+        for (size_t i = 0; i < page->used; i++)
+        {
+            mrl_drawable_destroy(
+                page->nodes[i].drawable);
+        }
 
-        mrl_canvas_node *next = current->next;
-        if (canvas != NULL)
-            free(current);
+        mrl_canvas_node_page *next =
+            page->next;
 
-        current = next;
+        free(page);
+
+        page = next;
     }
-
-    canvas->head = NULL;
-    canvas->tail = NULL;
 
     if (!canvas)
         return;
@@ -217,23 +189,32 @@ mrl_canvas_node *mrl_canvas_add(
     if (!canvas || !drawable)
         return NULL;
 
-    mrl_canvas_node *node = mrl_canvas_node_create(drawable);
+    mrl_canvas_node_page *page = canvas->last_page;
 
-    if (!node)
-        return NULL;
-
-    mrl_rect bounds = mrl_drawable_bounds(drawable, position);
-    mrl_canvas_node_set_bounds(node, bounds);
-
-    if (!mrl_canvas_get_head(canvas) || !mrl_canvas_get_tail(canvas))
+    if (!page || page->used >= MRL_CANVAS_NODE_PAGE_CAPACITY)
     {
-        mrl_canvas_set_head(canvas, node);
-        mrl_canvas_set_tail(canvas, node);
-        return node;
+        mrl_canvas_node_page *new_page = mrl_canvas_alloc_page();
+
+        if (!new_page)
+            return NULL;
+
+        if (!canvas->pages)
+            canvas->pages = new_page;
+        else
+            canvas->last_page->next = new_page;
+
+        canvas->last_page = new_page;
+        page = new_page;
     }
 
-    mrl_canvas_node_set_next(mrl_canvas_get_tail(canvas), node);
-    mrl_canvas_set_tail(canvas, mrl_canvas_node_get_next(mrl_canvas_get_tail(canvas)));
+    mrl_canvas_node *node = &page->nodes[page->used++];
+
+    memset(node, 0, sizeof(*node));
+
+    node->drawable = mrl_drawable_clone(drawable);
+    node->visible = true;
+    node->opacity = 1.0f;
+    node->bounds = mrl_drawable_bounds(drawable, position);
 
     return node;
 }
@@ -245,70 +226,66 @@ void mrl_canvas_render(mrl_canvas *canvas)
     int canvas_width = mrl_canvas_get_width(canvas);
     int canvas_height = mrl_canvas_get_height(canvas);
 
-    mrl_canvas_node *current_node = mrl_canvas_get_head(canvas);
-
-    while (current_node)
+    for (mrl_canvas_node_page *page = canvas->pages; page; page = page->next)
     {
-        mrl_rect bounds = mrl_canvas_node_get_bounds(current_node);
-
-        if (bounds.w <= 0 || bounds.h <= 0)
+        for (size_t i = 0; i < page->used; i++)
         {
-            current_node =
-                mrl_canvas_node_get_next(current_node);
+            mrl_canvas_node *current_node = &page->nodes[i];
 
-            continue;
-        }
+            mrl_rect bounds = mrl_canvas_node_get_bounds(current_node);
 
-        int start_x =
-            bounds.x < 0 ? 0 : bounds.x;
+            if (bounds.w <= 0 || bounds.h <= 0)
+                continue;
 
-        int start_y =
-            bounds.y < 0 ? 0 : bounds.y;
+            int start_x =
+                bounds.x < 0 ? 0 : bounds.x;
 
-        int end_x =
-            bounds.x + bounds.w;
+            int start_y =
+                bounds.y < 0 ? 0 : bounds.y;
 
-        int end_y =
-            bounds.y + bounds.h;
+            int end_x =
+                bounds.x + bounds.w;
 
-        if (end_x > canvas_width)
-            end_x = canvas_width;
+            int end_y =
+                bounds.y + bounds.h;
 
-        if (end_y > canvas_height)
-            end_y = canvas_height;
+            if (end_x > canvas_width)
+                end_x = canvas_width;
 
-        bool visible = mrl_canvas_node_get_visible(current_node);
-        float opacity = mrl_canvas_node_get_opacity(current_node);
+            if (end_y > canvas_height)
+                end_y = canvas_height;
 
-        if (visible)
-        {
-            mrl_drawable *drawable = mrl_canvas_node_get_drawable(current_node);
+            bool visible = mrl_canvas_node_get_visible(current_node);
+            float opacity = mrl_canvas_node_get_opacity(current_node);
 
-            for (int y = start_y; y < end_y; y++)
+            if (visible)
             {
-                int row = y * canvas_width;
+                mrl_drawable *drawable = mrl_canvas_node_get_drawable(current_node);
 
-                for (int x = start_x; x < end_x; x++)
+                for (int y = start_y; y < end_y; y++)
                 {
-                    int idx = row + x;
+                    int row = y * canvas_width;
 
-                    int local_x = x - bounds.x;
-                    int local_y = y - bounds.y;
-                    mrl_pos local_pos = MRL_POS(local_x, local_y);
-
-                    mrl_color out;
-
-                    if (mrl_drawable_sample(drawable, canvas, local_pos, &out))
+                    for (int x = start_x; x < end_x; x++)
                     {
-                        out.a = (mrl_u8)((float)out.a * opacity);
+                        int idx = row + x;
 
-                        pixels[idx] = mrl_color_blend(out, pixels[idx]);
+                        int local_x = x - bounds.x;
+                        int local_y = y - bounds.y;
+                        mrl_pos local_pos = MRL_POS(local_x, local_y);
+
+                        mrl_color out;
+
+                        if (mrl_drawable_sample(drawable, canvas, local_pos, &out))
+                        {
+                            out.a = (mrl_u8)((float)out.a * opacity);
+
+                            pixels[idx] = mrl_color_blend(out, pixels[idx]);
+                        }
                     }
                 }
             }
         }
-
-        current_node = mrl_canvas_node_get_next(current_node);
     }
 }
 
